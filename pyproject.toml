@@ -1,0 +1,37 @@
+[project]
+name = "fintech-mapping-engine"
+version = "0.1.0"
+description = "Real estate chart of accounts mapping engine"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "chromadb>=1.5.9",
+    "fastapi>=0.165.0",
+    "google-genai>=3.6.1",
+    "httpx>=0.28.1",
+    "numpy>=1.26",
+    "openpyxl>=3.1.5",
+    "pydantic>=2.10",
+    "python-dotenv>=1.2.4",
+    "rank-bm25>=0.2.2",
+    "sentence-transformers>=6.3.0",
+    "torch>=2.15.0",
+    "uvicorn>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -1,0 +1,14 @@
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!app/
+!app/**
+!data/
+!data/processed/
+data/processed/*
+!data/processed/abbrev_map.json
+!data/processed/red_flag_keywords.json
+!data/processed/target_coa.jsonl
+!data/processed/few_shot_kb.jsonl
+**/__pycache__/
