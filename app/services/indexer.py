@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -13,11 +14,14 @@ from rank_bm25 import BM25Okapi
 from app.retrieval_text import code_key, hierarchy_text
 from app.services.normalizer import Normalizer
 
-MODEL_NAME = "BAAI/bge-small-en-v1.5"
+PREVIOUS_MODEL = "BAAI/bge-small-en-v1.5"
+MODEL_NAME = PREVIOUS_MODEL
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 HISTORICAL_THRESHOLD = 0.85
 VOTE_THRESHOLD = 0.85
 CANDIDATE_LIMIT = 8
+GEMINI_SHORTLIST_LIMIT = 12
+RETRIEVAL_LIMIT = 25
 ACTIVE_TARGET_THRESHOLD = 0.55
 
 
@@ -51,9 +55,19 @@ def read_dataset(path: Path):
     return [json.loads(line) for line in raw.splitlines() if line.strip()], raw
 
 
-def collection_for(client, name, raw, model, documents, normalizer, metadata=None):
+def collection_for(
+    client,
+    name,
+    raw,
+    model,
+    documents,
+    normalizer,
+    metadata=None,
+    *,
+    model_name=MODEL_NAME,
+):
     rules = json.dumps(normalizer.abbreviations, sort_keys=True).encode()
-    digest = hashlib.sha256(MODEL_NAME.encode() + rules + raw).hexdigest()[:24]
+    digest = hashlib.sha256(model_name.encode() + rules + raw).hexdigest()[:24]
     collection = client.get_or_create_collection(
         name=f"{name}_{digest}",
         embedding_function=None,
@@ -87,12 +101,21 @@ def collection_for(client, name, raw, model, documents, normalizer, metadata=Non
 
 class SearchIndex:
     def __init__(
-        self, data_dir: Path, cache_dir: Path, normalizer: Normalizer, model=None
+        self,
+        data_dir: Path,
+        cache_dir: Path,
+        normalizer: Normalizer,
+        model=None,
+        *,
+        model_name=None,
+        candidate_limit=CANDIDATE_LIMIT,
     ):
+        self.model_name = model_name or os.getenv("EMBEDDING_MODEL", MODEL_NAME)
+        self.candidate_limit = candidate_limit
         if model is None:
             from sentence_transformers import SentenceTransformer
 
-            model = SentenceTransformer(MODEL_NAME, device="cpu")
+            model = SentenceTransformer(self.model_name, device="cpu")
         self.model = model
         self.model_lock = Lock()
         targets, target_raw = read_dataset(data_dir / "target_coa.jsonl")
@@ -125,6 +148,7 @@ class SearchIndex:
         self.target_positions = {
             code_key(target.code): i for i, target in enumerate(self.targets)
         }
+        self.target_codes = np.asarray([target.code for target in self.targets])
         client = chromadb.PersistentClient(path=str(cache_dir))
         target_collection = collection_for(
             client,
@@ -142,9 +166,16 @@ class SearchIndex:
                 }
                 for t in self.targets
             ],
+            model_name=self.model_name,
         )
         self.examples = collection_for(
-            client, "examples", example_raw, model, example_docs, normalizer
+            client,
+            "examples",
+            example_raw,
+            model,
+            example_docs,
+            normalizer,
+            model_name=self.model_name,
         )
         stored = target_collection.get(include=["embeddings"])
         order = np.argsort([int(identifier) for identifier in stored["ids"]])
@@ -165,6 +196,13 @@ class SearchIndex:
 
     def configure_history(self, examples, normalizer):
         self.example_rows = examples
+        self.example_codes = np.asarray([row["target_code"] for row in examples])
+        if examples:
+            stored = self.examples.get(include=["embeddings"])
+            order = np.argsort(np.asarray(stored["ids"], dtype=int))
+            self.example_vectors = np.asarray(stored["embeddings"], dtype=np.float32)[
+                order
+            ]
         self.exact_history = defaultdict(set)
         self.active_target_counts = Counter()
         positions = set()
@@ -214,20 +252,25 @@ class SearchIndex:
                     candidates = self.search(query, self.vectors @ vector, matches)
                 yield candidates
 
-    def historical_matches(self, vectors):
-        count = min(5, len(self.example_rows))
-        if not count:
+    def nearest_examples(self, vectors, count):
+        if not self.example_rows or not len(vectors):
             return [[] for _ in vectors]
-        result = self.examples.query(
-            query_embeddings=np.asarray(vectors), n_results=count, include=["distances"]
-        )
+        similarities = np.round(np.asarray(vectors) @ self.example_vectors.T, 6)
+        return [
+            [
+                (i, min(1.0, float(scores[i])))
+                for i in np.lexsort((self.example_codes, -scores))[:count]
+            ]
+            for scores in similarities
+        ]
+
+    def historical_matches(self, vectors):
         matches = []
-        for ids, distances in zip(result["ids"], result["distances"], strict=True):
+        for ranked in self.nearest_examples(vectors, 5):
             neighbors = []
-            for identifier, distance in zip(ids, distances, strict=True):
-                row = self.example_rows[int(identifier)]
+            for identifier, similarity in ranked:
+                row = self.example_rows[identifier]
                 position = self.target_positions.get(code_key(row["target_code"]))
-                similarity = min(1.0, 1.0 - distance)
                 neighbors.append((position, similarity))
             matches.append(neighbors)
         return matches
@@ -274,7 +317,13 @@ class SearchIndex:
         scores[exact_names] += 0.12
         # Sort before clipping so very strong candidates still have a stable lead.
         eligible = np.arange(len(self.targets)) if positions is None else positions
-        ranked = list(eligible[np.argsort(-scores[eligible], kind="stable")])
+        ranked = list(
+            eligible[
+                np.lexsort(
+                    (self.target_codes[eligible], -np.round(scores[eligible], 6))
+                )
+            ]
+        )
         nearest = neighbors[:3]
         unanimous = None
         if (
@@ -292,11 +341,11 @@ class SearchIndex:
         # Keep the best hybrid hits and reserve room for distinct historical targets.
         voted = sorted(
             (i for i in votes if np.isfinite(scores[i])),
-            key=lambda i: (-votes[i], -matches[i], i),
+            key=lambda i: (-votes[i], -matches[i], self.targets[i].code),
         )
-        ranked = list(dict.fromkeys([*ranked[:5], *voted, *ranked[:CANDIDATE_LIMIT]]))[
-            :CANDIDATE_LIMIT
-        ]
+        ranked = list(
+            dict.fromkeys([*ranked[:5], *voted, *ranked[: self.candidate_limit]])
+        )[: self.candidate_limit]
         return [
             Candidate(
                 self.targets[i],
@@ -313,13 +362,7 @@ class SearchIndex:
         ]
 
     def similar_examples(self, vectors):
-        count = min(3, len(self.example_rows))
-        if not count:
-            return [[] for _ in vectors]
-        result = self.examples.query(
-            query_embeddings=np.asarray(vectors), n_results=count, include=[]
-        )
         return [
-            [self.example_rows[int(identifier)] for identifier in ids]
-            for ids in result["ids"]
+            [self.example_rows[identifier] for identifier, _ in ranked]
+            for ranked in self.nearest_examples(vectors, 3)
         ]

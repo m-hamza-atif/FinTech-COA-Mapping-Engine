@@ -14,7 +14,7 @@ from app.schemas.contracts import AIInput, AIOutput
 from app.services.indexer import Candidate, SearchIndex, Target
 from app.services.llm_reranker import Decision, GeminiReranker, RerankInput
 from app.services.normalizer import Normalizer
-from app.services.retriever import MappingEngine, happy_path
+from app.services.retriever import LocalReranker, MappingEngine, happy_path
 
 CANDIDATES = [
     Candidate(
@@ -59,8 +59,9 @@ def test_endpoint_exclusions_and_happy_path(tmp_path, monkeypatch):
     index = StubIndex()
     reranker = SimpleNamespace(enabled=True, rerank=AsyncMock(), close=AsyncMock())
     monkeypatch.setattr(main, "SearchIndex", lambda *_: index)
-    monkeypatch.setattr(main, "GeminiReranker", lambda *_: reranker)
+    monkeypatch.setattr(main, "GeminiReranker", lambda *_, **__: reranker)
     monkeypatch.setenv("MAPPING_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("RERANKER_MODEL", "off")
     with TestClient(main.app, follow_redirects=False) as client:
         assert client.get("/health").json() == {
             "status": "ok",
@@ -149,7 +150,7 @@ def test_red_flag_invokes_structured_rerank_and_caps_confidence(tmp_path):
     assert generate.await_args.kwargs["config"].response_mime_type == "application/json"
 
 
-def test_rate_limit_retries_with_batched_fallback(tmp_path, monkeypatch):
+def test_rate_limit_retries_with_batched_fallback(tmp_path):
     async def run():
         async def rate_limit(**kwargs):
             raise errors.ClientError(429, {"error": {"message": "Rate limited"}})
@@ -175,7 +176,6 @@ def test_rate_limit_retries_with_batched_fallback(tmp_path, monkeypatch):
         assert generate.await_args_list[1].kwargs["model"] == "gemini-3.5-flash-lite"
         assert reranker.response_issues["cooldown_waits"] == 1
 
-    monkeypatch.setattr("app.services.llm_reranker.asyncio.sleep", AsyncMock())
     asyncio.run(run())
 
 
@@ -254,6 +254,61 @@ def test_unanimous_vote_approves_only_without_red_flags():
     assert not happy_path([candidate], has_red_flag=True)
 
 
+def test_cross_encoder_shortlist_breaks_ties_by_target_code(tmp_path):
+    from contextlib import nullcontext
+
+    pool = [
+        Candidate(Target(f"{number:04}", "Cash", "Assets", "Debit"), 0.7)
+        for number in range(25, 0, -1)
+    ]
+    cross = SimpleNamespace(
+        lock=nullcontext(),
+        model=SimpleNamespace(predict=lambda pairs, **_: [0.5] * len(pairs)),
+    )
+    local = SimpleNamespace(rank=lambda rows: LocalReranker.rank(cross, rows))
+    index = SimpleNamespace(embed=StubIndex().embed, search_batch=lambda *_: [pool])
+    engine = MappingEngine(Normalizer(tmp_path), index, GeminiReranker(None), local)
+    accounts = AIInput.model_validate(payload(account("51", "Cash"))).accounts
+    observed = []
+    rows = asyncio.run(
+        engine.map_accounts(
+            accounts, observe_pool=lambda _, candidates: observed.extend(candidates)
+        )
+    )
+    assert len(observed) == 25
+    assert rows[0].predicted_target_code == "0001"
+    assert [candidate.code for candidate in rows[0].top_k_candidates] == [
+        f"{number:04}" for number in range(1, 9)
+    ]
+    assert rows[0].routing_status == "NEEDS_REVIEW"
+
+
+def test_gemini_can_select_twelfth_candidate_without_expanding_public_alternatives(
+    tmp_path,
+):
+    pool = [
+        Candidate(Target(f"{number:04}", "Cash", "Assets", "Debit"), 0.7)
+        for number in range(1, 13)
+    ]
+    rerank = AsyncMock(
+        return_value={
+            0: Decision(
+                index=0, chosen_code="0012", llm_confidence=0.9, reasoning="Evidence."
+            )
+        }
+    )
+    gemini = SimpleNamespace(enabled=True, rerank=rerank)
+    index = StubIndex()
+    index.search_batch = lambda *_: [pool]
+    engine = MappingEngine(Normalizer(tmp_path), index, gemini)
+    accounts = AIInput.model_validate(payload(account("51", "Cash"))).accounts
+    (row,) = asyncio.run(engine.map_accounts(accounts))
+    assert len(rerank.await_args.args[0][0].candidates) == 12
+    assert row.predicted_target_code == "0012"
+    assert len(row.top_k_candidates) == 8
+    assert row.routing_status == "NEEDS_REVIEW"
+
+
 def test_service_error_retries_on_fallback_model():
     success = SimpleNamespace(
         text=json.dumps(
@@ -280,7 +335,8 @@ def test_service_error_retries_on_fallback_model():
     )
     reranker = GeminiReranker(None, client=client)
     item = RerankInput("Building", "building", "Debit", CANDIDATES, [])
-    assert 0 in asyncio.run(reranker.rerank([item], timeout=1))
+    decisions = asyncio.run(reranker.rerank([item], timeout=1))
+    assert decisions[0].model == "gemini-3.5-flash-lite"
     assert [call.kwargs["model"] for call in generate.await_args_list] == [
         "gemini-3.6-flash",
         "gemini-3.5-flash-lite",

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import random
 import sys
@@ -25,7 +26,10 @@ from app.retrieval_text import code_key
 from app.schemas.contracts import Account, MappingResult
 from app.services.indexer import (
     ACTIVE_TARGET_THRESHOLD,
-    MODEL_NAME,
+    CANDIDATE_LIMIT,
+    GEMINI_SHORTLIST_LIMIT,
+    PREVIOUS_MODEL,
+    RETRIEVAL_LIMIT,
     VOTE_THRESHOLD,
     Candidate,
     SearchIndex,
@@ -38,9 +42,11 @@ from app.services.llm_reranker import (
 )
 from app.services.llm_reranker import (
     DEFAULT_MODEL,
+    FALLBACK_MODEL,
     SYSTEM_INSTRUCTION,
     Decision,
     GeminiReranker,
+    rerank_record,
 )
 from app.services.normalizer import Normalizer
 from app.services.retriever import (
@@ -49,6 +55,8 @@ from app.services.retriever import (
     MIN_APPROVAL_HISTORY,
     MIN_DENSE,
     MIN_MARGIN,
+    RERANKER_MODEL,
+    LocalReranker,
     MappingEngine,
     excluded,
     excluded_result,
@@ -90,16 +98,21 @@ def read_cases(data_dir):
 class BudgetedReranker(GeminiReranker):
     """Use the production reranker with a reproducible account budget."""
 
-    def __init__(self, api_key, model, account_limit, cache_path, dataset_hash):
+    def __init__(
+        self, api_key, model, account_limit, cache_path, dataset_hash, pace_seconds
+    ):
         super().__init__(
-            api_key if account_limit else None, model, batch_size=GEMINI_BATCH_SIZE
+            api_key if account_limit else None,
+            model,
+            batch_size=GEMINI_BATCH_SIZE,
+            pace_seconds=pace_seconds,
         )
         self.remaining = account_limit
         self.cache_path = cache_path
         self.dataset_hash = dataset_hash
         self.cache = (
             json.loads(cache_path.read_text(encoding="utf-8"))
-            if cache_path.is_file()
+            if cache_path is not None and cache_path.is_file()
             else {}
         )
         self.initial_cache_keys = frozenset(self.cache)
@@ -125,9 +138,7 @@ class BudgetedReranker(GeminiReranker):
                     self.model,
                     SYSTEM_INSTRUCTION,
                     self.dataset_hash,
-                    item.source_name,
-                    item.normalized_name,
-                    item.normal_balance,
+                    rerank_record(0, item),
                 ]
             ).encode()
             key = hashlib.sha256(fingerprint).hexdigest()
@@ -155,7 +166,7 @@ class BudgetedReranker(GeminiReranker):
         return results
 
     def save(self):
-        if self.cache_changed:
+        if self.cache_changed and self.cache_path is not None:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.cache_path.with_suffix(".tmp")
             temporary.write_text(
@@ -171,12 +182,13 @@ def rank_baseline(accounts, targets, scores_by_name, label):
         )
     )
     results = []
+    codes = np.asarray([target.code for target in targets])
     for account in accounts:
         if excluded(account):
             results.append(excluded_result(account))
             continue
         scores = next(scored)
-        ranked = np.argsort(-scores, kind="stable")[:5]
+        ranked = np.lexsort((codes, -np.round(scores, 6)))[:5]
         candidates = [Candidate(targets[i], float(scores[i])) for i in ranked]
         best = candidates[0]
         status = "AUTO_APPROVED" if best.score >= AUTO_APPROVE else "NEEDS_REVIEW"
@@ -307,18 +319,196 @@ async def measure(cases, predict, *, hybrid=False):
     return summarize(cases, outputs, elapsed, hybrid=hybrid)
 
 
+def split_cases(cases):
+    labeled = [
+        case
+        for case in cases
+        if case.target_code and case.expected_status != "EXCLUDED"
+    ]
+    return {
+        "eval_399": labeled[200:],
+        "dev_200": labeled[:200],
+        "other": [
+            case
+            for case in cases
+            if not case.target_code or case.expected_status == "EXCLUDED"
+        ],
+    }
+
+
+async def measure_system(engine, cases, *, overall, selected_split=None):
+    partitions = split_cases(cases)
+    if selected_split:
+        partitions = {
+            selected_split: partitions[selected_split],
+            "exclusion_audit": [
+                case for case in cases if case.expected_status == "EXCLUDED"
+            ],
+        }
+    summaries = {}
+    all_cases, all_results = [], []
+    all_seconds = 0.0
+    all_hits = 0
+    for name, rows in partitions.items():
+        if not rows or (name == "other" and not overall):
+            continue
+        print(f"Evaluating {name} ({len(rows)} accounts).", flush=True)
+        outputs = []
+        elapsed = 0.0
+        hits = 0
+        shortlist_hits = local_top1 = local_top3 = 0
+        paired = {}
+        for start in range(0, len(rows), BATCH_SIZE):
+            batch = rows[start : start + BATCH_SIZE]
+
+            def observe_pool(position, pool, batch=batch):
+                nonlocal hits
+                expected = code_key(batch[position].target_code)
+                if expected and batch[position].expected_status != "EXCLUDED":
+                    hits += any(
+                        code_key(candidate.target.code) == expected
+                        for candidate in pool
+                    )
+
+            def observe_decision(position, local, decision, batch=batch, paired=paired):
+                expected = code_key(batch[position].target_code)
+                if not expected:
+                    return
+                counts = paired.setdefault(
+                    decision.model or "unknown",
+                    {"usable": 0, "local_correct": 0, "llm_correct": 0},
+                )
+                counts["usable"] += 1
+                counts["local_correct"] += code_key(local.target.code) == expected
+                counts["llm_correct"] += code_key(decision.chosen_code) == expected
+
+            def observe_shortlist(position, candidates, batch=batch):
+                nonlocal shortlist_hits, local_top1, local_top3
+                expected = code_key(batch[position].target_code)
+                if expected and batch[position].expected_status != "EXCLUDED":
+                    codes = [
+                        code_key(candidate.target.code) for candidate in candidates
+                    ]
+                    shortlist_hits += expected in codes
+                    local_top1 += expected == codes[0]
+                    local_top3 += expected in codes[:3]
+
+            started = perf_counter()
+            outputs.extend(
+                await engine.map_accounts(
+                    [case.account for case in batch],
+                    observe_pool=observe_pool,
+                    observe_decision=observe_decision,
+                    observe_shortlist=observe_shortlist,
+                )
+            )
+            elapsed += perf_counter() - started
+            if len(outputs) % 100 == 0:
+                print(f"{name}: evaluated {len(outputs)}/{len(rows)}.", flush=True)
+        summary = summarize(rows, outputs, elapsed, hybrid=True)
+        summary["recall_at_25"] = rate(hits, summary["counts"]["labeled"])
+        summary["local_retrieval"] = {
+            "shortlist_k": engine.shortlist_limit,
+            "shortlist_hits": shortlist_hits,
+            "shortlist_recall": rate(shortlist_hits, summary["counts"]["labeled"]),
+            "local_top1": rate(local_top1, summary["counts"]["labeled"]),
+            "local_top3": rate(local_top3, summary["counts"]["labeled"]),
+        }
+        summary["paired_by_model"] = {
+            model: {
+                **counts,
+                "local_top1_on_usable": rate(counts["local_correct"], counts["usable"]),
+                "llm_top1_on_usable": rate(counts["llm_correct"], counts["usable"]),
+            }
+            for model, counts in paired.items()
+        }
+        summaries[name] = summary
+        if overall:
+            all_cases.extend(rows)
+            all_results.extend(outputs)
+            all_seconds += elapsed
+            all_hits += hits
+    if overall:
+        summaries["overall"] = summarize(
+            all_cases, all_results, all_seconds, hybrid=True
+        )
+        summaries["overall"]["recall_at_25"] = rate(
+            all_hits, summaries["overall"]["counts"]["labeled"]
+        )
+    return summaries
+
+
+async def offline_experiment(args):
+    cases, golden_hash = read_cases(args.data_dir)
+    normalizer = Normalizer(args.data_dir)
+    base_model = "BAAI/bge-base-en-v1.5"
+    reranker_model = args.reranker_model
+    configurations = [
+        ("Previous retrieval", PREVIOUS_MODEL, None),
+        ("Experiment 1A", base_model, None),
+    ]
+    if reranker_model:
+        configurations.append(("Experiment 1B", base_model, reranker_model))
+    summary = {
+        "golden_sha256": golden_hash,
+        "shuffle_seed": SEED,
+        "gemini_requests": 0,
+        "batch_size": BATCH_SIZE,
+        "active_target_threshold": ACTIVE_TARGET_THRESHOLD,
+        "omp_num_threads": os.getenv("OMP_NUM_THREADS"),
+        "results": {},
+    }
+    index = None
+    for name, model, reranker_name in configurations:
+        print(f"Starting {name}.", flush=True)
+        if index is None or index.model_name != model:
+            index = SearchIndex(
+                args.data_dir,
+                args.cache_dir,
+                normalizer,
+                model_name=model,
+                candidate_limit=RETRIEVAL_LIMIT,
+            )
+        local = LocalReranker(reranker_name) if reranker_name else None
+        engine = MappingEngine(normalizer, index, GeminiReranker(None), local)
+        engine.shortlist_limit = CANDIDATE_LIMIT
+        summary["results"][name] = {
+            "embedding_model": model,
+            "reranker_model": reranker_name,
+            "splits": await measure_system(engine, cases, overall=args.overall),
+        }
+        write_offline_report(args.output_dir, summary)
+
+
 async def benchmark(args):
     cases, golden_hash = read_cases(args.data_dir)
     # Spend the live budget on accounts that contribute to accuracy metrics.
     cases.sort(key=lambda case: not bool(case.target_code))
     normalizer = Normalizer(args.data_dir)
-    index = SearchIndex(args.data_dir, args.cache_dir, normalizer)
+    index = SearchIndex(
+        args.data_dir,
+        args.cache_dir,
+        normalizer,
+        candidate_limit=RETRIEVAL_LIMIT
+        if args.reranker_model
+        else GEMINI_SHORTLIST_LIMIT,
+    )
+    local_model = args.reranker_model
+    local = LocalReranker(local_model) if local_model else None
+    if args.split:
+        return await split_benchmark(args, cases, golden_hash, normalizer, index, local)
     target_rows, raw = read_dataset(args.data_dir / "target_coa.jsonl")
     names = [row["target_name"] for row in target_rows]
     lexical = BM25Okapi([tokenize(name) for name in names])
     client = chromadb.PersistentClient(path=str(args.cache_dir))
     collection = collection_for(
-        client, "benchmark_names", raw, index.model, names, normalizer
+        client,
+        "benchmark_names",
+        raw,
+        index.model,
+        names,
+        normalizer,
+        model_name=index.model_name,
     )
     documents = collection.get(include=["embeddings"])
     order = np.argsort(np.asarray(documents["ids"], dtype=int))
@@ -334,10 +524,11 @@ async def benchmark(args):
         os.getenv("GEMINI_API_KEY"),
         model,
         args.llm_limit,
-        args.cache_dir / "benchmark_gemini_v3.json",
+        args.cache_dir / "benchmark_gemini_v4.json",
         snapshot.hexdigest(),
+        args.pace_seconds,
     )
-    engine = MappingEngine(normalizer, index, reranker)
+    engine = MappingEngine(normalizer, index, reranker, local)
     try:
         results = {
             "baseline_a": await measure(
@@ -358,8 +549,9 @@ async def benchmark(args):
                     "Raw-name cosine similarity.",
                 ),
             ),
-            "system_c": await measure(cases, engine.map_accounts, hybrid=True),
         }
+        splits = await measure_system(engine, cases, overall=True)
+        results["system_c"] = splits.pop("overall")
         reranker.save()
     finally:
         await reranker.close()
@@ -370,7 +562,8 @@ async def benchmark(args):
             "target_accounts": len(names),
         },
         "settings": {
-            "embedding_model": MODEL_NAME,
+            "embedding_model": index.model_name,
+            "reranker_model": local_model if local else None,
             "auto_approve_threshold": AUTO_APPROVE,
             "happy_path_dense_threshold": MIN_DENSE,
             "happy_path_historical_threshold": MIN_APPROVAL_HISTORY,
@@ -384,6 +577,7 @@ async def benchmark(args):
         },
         "llm": {
             "model": model,
+            "pace_seconds": args.pace_seconds,
             "account_limit": args.llm_limit,
             "selected_accounts": reranker.attempted_accounts,
             "live_accounts": reranker.live_accounts,
@@ -396,6 +590,62 @@ async def benchmark(args):
             "response_issues": dict(reranker.response_issues),
         },
         "results": results,
+        "splits": splits,
+    }
+
+
+async def split_benchmark(args, cases, golden_hash, normalizer, index, local):
+    key = os.getenv("GEMINI_API_KEY")
+    if args.llm_limit and not key:
+        raise ValueError("Set GEMINI_API_KEY to run a live split benchmark.")
+    model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
+    reranker = BudgetedReranker(
+        key, model, args.llm_limit, None, golden_hash, args.pace_seconds
+    )
+    engine = MappingEngine(normalizer, index, reranker, local)
+    try:
+        splits = await measure_system(
+            engine, cases, overall=False, selected_split=args.split
+        )
+    finally:
+        await reranker.close()
+    metrics = splits[args.split]
+    if index.candidate_limit < RETRIEVAL_LIMIT:
+        metrics.pop("recall_at_25")
+    for name in (model, FALLBACK_MODEL):
+        metrics["paired_by_model"].setdefault(
+            name,
+            {
+                "usable": 0,
+                "local_correct": 0,
+                "llm_correct": 0,
+                "local_top1_on_usable": None,
+                "llm_top1_on_usable": None,
+            },
+        )
+    return {
+        "split": args.split,
+        "golden_sha256": golden_hash,
+        "seed": SEED,
+        "embedding_model": index.model_name,
+        "reranker_model": args.reranker_model,
+        "gemini": {
+            "primary": model,
+            "fallback": FALLBACK_MODEL,
+            "pace_seconds": args.pace_seconds,
+            "account_limit": args.llm_limit,
+            "selected_accounts": reranker.attempted_accounts,
+            "usable_decisions": reranker.successful_accounts,
+            "usable_rate": rate(
+                reranker.successful_accounts, reranker.attempted_accounts
+            ),
+            "prior_cache_hits": reranker.prior_cache_hits,
+            "same_run_cache_hits": reranker.cached_accounts,
+            "requests_by_model": dict(reranker.request_models),
+            "response_issues": dict(reranker.response_issues),
+        },
+        "results": metrics,
+        "exclusion_audit": splits.get("exclusion_audit"),
     }
 
 
@@ -403,8 +653,80 @@ def percent(value):
     return "N/A" if value is None else f"{value:.2%}"
 
 
+def write_split_report(output_dir, summary):
+    result = summary["results"]
+    local = result["local_retrieval"]
+    gemini = summary["gemini"]
+    audit = summary["exclusion_audit"]
+    rows = [
+        ("Local Top-1", local["local_top1"]),
+        ("Local Top-3", local["local_top3"]),
+        (f"Local Recall@{local['shortlist_k']}", local["shortlist_recall"]),
+        ("Happy Path precision", result["happy_path_precision"]),
+        ("Happy Path coverage", result["llm_call_reduction"]),
+        ("End-to-end Top-1", result["top_1_accuracy"]),
+        ("End-to-end Top-3", result["top_3_recall"]),
+        ("End-to-end auto-approve precision", result["auto_approve_precision"]),
+        (
+            "Exclusion accuracy (separate audit)",
+            audit["exception_handling_accuracy"] if audit else None,
+        ),
+    ]
+    lines = [
+        "# Final paced Gemini evaluation",
+        "",
+        f"Split `{summary['split']}`, seed {summary['seed']}, {result['counts']['labeled']} labeled accounts.",
+        f"Embeddings `{summary['embedding_model']}`, cross-encoder `{summary['reranker_model'] or 'off'}`.",
+        "",
+        "| Metric | Result |",
+        "|---|---:|",
+        *(f"| {label} | {percent(value)} |" for label, value in rows),
+        "",
+        (
+            f"Gemini pace {gemini['pace_seconds']:.1f} s. "
+            f"Usable decisions {gemini['usable_decisions']}/{gemini['selected_accounts']} "
+            f"({percent(gemini['usable_rate'])}), with {gemini['prior_cache_hits']} prior cache hits."
+        ),
+        "",
+        "| Model | Usable labeled rows | Local Top-1 on usable | Gemini Top-1 on usable | API requests |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for model, pair in result["paired_by_model"].items():
+        lines.append(
+            f"| {model} | {pair['usable']} | {percent(pair['local_top1_on_usable'])} | "
+            f"{percent(pair['llm_top1_on_usable'])} | {gemini['requests_by_model'].get(model, 0)} |"
+        )
+    pairs = result["paired_by_model"].values()
+    usable = sum(pair["usable"] for pair in pairs)
+    local_correct = sum(pair["local_correct"] for pair in pairs)
+    llm_correct = sum(pair["llm_correct"] for pair in pairs)
+    lines.append(
+        f"| All | {usable} | {percent(rate(local_correct, usable))} | "
+        f"{percent(rate(llm_correct, usable))} | {sum(gemini['requests_by_model'].values())} |"
+    )
+    diagnostics = ", ".join(
+        f"{key.replace('_', ' ')} ({count})"
+        for key, count in sorted(gemini["response_issues"].items())
+        if count
+    )
+    if diagnostics:
+        lines.extend(
+            ["", f"API diagnostics can overlap across attempts. {diagnostics}."]
+        )
+    lines.extend(
+        [
+            "",
+            (
+                "The usable rate uses selected accounts as the denominator. "
+                "Paired accuracy compares predictions on the same labeled rows. "
+                "Exclusions are audited separately from held-out mapping accuracy."
+            ),
+        ]
+    )
+    write_run_files(output_dir, summary, lines)
+
+
 def write_reports(output_dir, summary):
-    output_dir.mkdir(parents=True, exist_ok=True)
     results = summary["results"]
     counts = results["system_c"]["counts"]
     llm = summary["llm"]
@@ -456,7 +778,7 @@ def write_reports(output_dir, summary):
         (
             f"- System C searches {summary['settings']['active_targets']:,} active targets first "
             f"and widens to the full COA when the best score is below {summary['settings']['active_target_threshold']:.2f}. "
-            f"Its eight-candidate pool recalled {percent(results['system_c']['candidate_pool_recall'])} of labeled targets."
+            f"Its eight displayed candidates recalled {percent(results['system_c']['candidate_pool_recall'])} of labeled targets."
         ),
         (
             f"- The Happy Path gate alone mapped {counts['happy_path_correct']} of "
@@ -500,29 +822,158 @@ def write_reports(output_dir, summary):
             -1,
             f"- Gemini attempt diagnostics were {details}. Counts can overlap across retries.",
         )
-    (output_dir / "benchmark_summary.json").write_text(
+    lines.extend(
+        [
+            "## Paired Gemini accuracy on usable decisions",
+            "",
+            "| Split | Model | Usable labeled decisions | Local Top-1 | Gemini Top-1 |",
+            "|---|---|---:|---:|---:|",
+        ]
+    )
+    for split, metrics in summary["splits"].items():
+        for model, pair in metrics["paired_by_model"].items():
+            lines.append(
+                f"| {split} | {model} | {pair['usable']} | "
+                f"{percent(pair['local_top1_on_usable'])} | {percent(pair['llm_top1_on_usable'])} |"
+            )
+    write_run_files(output_dir, summary, lines)
+
+
+def write_offline_report(output_dir, summary):
+    lines = [
+        "# Experiment 1 - Offline retrieval comparison",
+        "",
+        f"Golden set SHA-256 `{summary['golden_sha256']}`. Split seed {summary['shuffle_seed']}. Gemini requests: 0.",
+        "",
+        "| Configuration | Split | Recall@25 | Recall@8 | Local Top-1 | Local Top-3 | Happy Path precision | Happy Path coverage | Seconds / 100 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name, config in summary["results"].items():
+        for split, metrics in config["splits"].items():
+            if split == "other":
+                continue
+            columns = [
+                percent(metrics[key])
+                for key in (
+                    "recall_at_25",
+                    "candidate_pool_recall",
+                    "top_1_accuracy",
+                    "top_3_recall",
+                    "happy_path_precision",
+                    "llm_call_reduction",
+                )
+            ]
+            columns.append(f"{metrics['average_latency_seconds_per_100']:.2f}")
+            lines.append("| " + " | ".join([name, split, *columns]) + " |")
+    lines.extend(["", "## Model configuration", ""])
+    for name, config in summary["results"].items():
+        lines.append(
+            f"- {name} uses `{config['embedding_model']}` with "
+            f"{config['reranker_model'] or 'the hybrid order'} for final selection."
+        )
+    lines.extend(
+        [
+            "",
+            (
+                "Recall@25 uses the hybrid pool before reranking. Happy Path coverage uses non-excluded accounts. "
+                "Latency includes embedding, retrieval, and local reranking, with loaded model weights and indexes."
+            ),
+            (
+                "All configurations use the same deterministic score ordering and exact historical-neighbor search. "
+                "For cross-encoder runs the deterministic approval gate retains its hybrid winner."
+            ),
+            "",
+        ]
+    )
+    if "Experiment 1B" in summary["results"]:
+        metrics = summary["results"]["Experiment 1B"]["splits"].get("eval_399")
+        if metrics:
+            passed = (
+                metrics["candidate_pool_recall"] >= 0.618
+                and metrics["average_latency_seconds_per_100"] < 10
+            )
+            lines.append(
+                f"Held-out success criterion (Recall@8 ≥ 61.8% and < 10 seconds / 100): "
+                f"{'met' if passed else 'missed'}."
+            )
+    write_run_files(output_dir, summary, lines)
+
+
+def write_run_files(output_dir, summary, lines):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "benchmark_run_summary.json").write_text(
         json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )
-    (output_dir / "benchmark_report.md").write_text("\n".join(lines), encoding="utf-8")
+    (output_dir / "benchmark_run_report.md").write_text(
+        "\n".join(lines), encoding="utf-8"
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data" / "processed")
     parser.add_argument("--cache-dir", type=Path, default=ROOT / ".chroma")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "reports")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=ROOT / "reports" / "latest",
+        help="Directory for the generated report and JSON, replaced on each run",
+    )
     parser.add_argument(
         "--llm-limit",
         type=int,
         default=12,
         help="Maximum accounts eligible for Gemini reranking",
     )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Run the three offline retrieval configurations",
+    )
+    parser.add_argument(
+        "--overall",
+        action="store_true",
+        help="Include all golden accounts in the offline results",
+    )
+    parser.add_argument(
+        "--no-cross-encoder",
+        action="store_true",
+        help="Disable local cross-encoder reranking",
+    )
+    parser.add_argument(
+        "--pace-seconds",
+        type=float,
+        default=0.0,
+        help="Minimum interval between Gemini request starts",
+    )
+    parser.add_argument(
+        "--split",
+        choices=("dev_200", "eval_399"),
+        help="Evaluate only this labeled split and audit exclusions",
+    )
     args = parser.parse_args()
     if args.llm_limit < 0:
         parser.error("--llm-limit must be nonnegative")
+    if not math.isfinite(args.pace_seconds) or args.pace_seconds < 0:
+        parser.error("--pace-seconds must be finite and nonnegative")
     load_dotenv(ROOT / ".env")
-    summary = asyncio.run(benchmark(args))
-    write_reports(args.output_dir, summary)
+    if args.no_llm and args.split:
+        args.llm_limit = 0
+    local_model = os.getenv(
+        "RERANKER_MODEL", RERANKER_MODEL if args.no_llm and not args.split else "off"
+    ).strip()
+    args.reranker_model = (
+        None
+        if args.no_cross_encoder
+        or local_model.casefold() in {"", "off", "none", "disabled"}
+        else local_model
+    )
+    if args.split:
+        write_split_report(args.output_dir, asyncio.run(benchmark(args)))
+    elif args.no_llm:
+        asyncio.run(offline_experiment(args))
+    else:
+        write_reports(args.output_dir, asyncio.run(benchmark(args)))
     print(f"Wrote benchmark results to {args.output_dir}")
 
 

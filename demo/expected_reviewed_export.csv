@@ -1,0 +1,5 @@
+﻿source_code,source_name,target_code,target_name,target_hierarchy,routing_status,review_status,review_version,entity_id,target_schema,row_number,source_excluded,normal_balance,ending_balance
+1320-200,Interest Receivable,1618-9010,Interest Receivable,ASSETS > CURRENT ASSETS > ACCOUNTS RECEIVABLE (CURRENT) > OTHER RECEIVABLES,AUTO_APPROVED,approved,1,PMC_01,entity_1_ucoa,2,false,Debit,14250.0
+1601-030,Reimbursable Cdn - Unreconciled Credit Cards,1610-1911,Credit Accounts Receivable Balances,,NEEDS_REVIEW,corrected,1,PMC_01,entity_1_ucoa,3,false,Debit,
+999900,Dormant ledger control,,,,EXCLUDED,excluded,1,PMC_01,entity_1_ucoa,4,true,,
+000004,,,,,EXCLUDED,excluded,1,PMC_01,entity_1_ucoa,5,true,,

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import random
 from collections import Counter
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ class Decision(ContractModel):
     chosen_code: Description
     llm_confidence: ConfidenceScore
     reasoning: Description
+    model: str | None = None
 
     def review_confidence(self, retrieval_score: float) -> float:
         return min(
@@ -90,7 +92,10 @@ class GeminiReranker:
         client=None,
         *,
         batch_size=BATCH_SIZE,
+        pace_seconds=0.0,
     ):
+        if not math.isfinite(pace_seconds) or pace_seconds < 0:
+            raise ValueError("Gemini pace must be finite and nonnegative.")
         self.transport = None
         self.client = client
         if client is None and api_key:
@@ -109,6 +114,9 @@ class GeminiReranker:
         self.request_models = Counter()
         self.response_issues = Counter()
         self.cooldown_until = 0.0
+        self.pace_seconds = pace_seconds
+        self.pace_lock = asyncio.Lock()
+        self.next_request_at = 0.0
 
     @property
     def enabled(self):
@@ -162,7 +170,7 @@ class GeminiReranker:
             for attempt in range(2):
                 try:
                     decisions = await self._with_quota_fallback(
-                        pending, use_fallback, recovery_model
+                        pending, use_fallback, recovery_model, rate_limited
                     )
                 except errors.APIError as error:
                     self.response_issues[f"http_{error.code}_rows"] += len(pending)
@@ -187,6 +195,9 @@ class GeminiReranker:
                 except (ValueError, TypeError):
                     self.response_issues["malformed_json_rows"] += len(pending)
                     decisions = {}
+                if decisions is None:
+                    self.response_issues["quota_skipped_rows"] += len(pending)
+                    return
                 results.update(decisions)
                 pending = [row for row in pending if row["index"] not in decisions]
                 if not pending:
@@ -194,30 +205,45 @@ class GeminiReranker:
                 if attempt == 0:
                     self.response_issues["retried_response_rows"] += len(pending)
 
-    async def _with_quota_fallback(self, records, use_fallback, recovery_model):
+    async def _with_quota_fallback(
+        self, records, use_fallback, recovery_model, rate_limited
+    ):
         model = (
             FALLBACK_MODEL if use_fallback.is_set() else recovery_model or self.model
         )
         try:
-            return await self._request(records, model)
+            return await self._request(records, model, rate_limited)
         except errors.APIError as error:
             if error.code != 429:
                 raise
             if model != FALLBACK_MODEL:
                 self.response_issues["primary_rate_limited_rows"] += len(records)
                 use_fallback.set()
-                return await self._request(records, FALLBACK_MODEL)
+                return await self._request(records, FALLBACK_MODEL, rate_limited)
             if self.model == FALLBACK_MODEL:
-                return await self._request(records, FALLBACK_MODEL)
+                return await self._request(records, FALLBACK_MODEL, rate_limited)
             raise
 
-    async def _request(self, records, model):
+    async def _request(self, records, model, rate_limited):
         loop = asyncio.get_running_loop()
-        delay = self.cooldown_until - loop.time()
-        if delay > 0:
-            self.cooldown_until += random.uniform(0.5, 1.0)
-            self.response_issues["cooldown_waits"] += 1
-            await asyncio.sleep(delay)
+        async with self.pace_lock:
+            if rate_limited.is_set():
+                return None
+            if max(self.cooldown_until, self.next_request_at) > loop.time():
+                self.response_issues[
+                    "cooldown_waits"
+                    if self.cooldown_until >= self.next_request_at
+                    else "paced_waits"
+                ] += 1
+            while (
+                delay := max(self.cooldown_until, self.next_request_at) - loop.time()
+            ) > 0:
+                if rate_limited.is_set():
+                    return None
+                await asyncio.sleep(delay)
+            if rate_limited.is_set():
+                return None
+            self.next_request_at = loop.time() + self.pace_seconds
         self.request_models[model] += 1
         try:
             response = await self.client.aio.models.generate_content(
@@ -230,7 +256,7 @@ class GeminiReranker:
                     thinking_config=types.ThinkingConfig(thinking_level="LOW")
                     if model == DEFAULT_MODEL
                     else None,
-                    temperature=0,
+                    temperature=0.0,
                 ),
             )
         except errors.APIError as error:
@@ -266,7 +292,7 @@ class GeminiReranker:
                 self.response_issues["out_of_pool_or_unknown_index"] += 1
             else:
                 results[decision.index] = decision.model_copy(
-                    update={"chosen_code": code}
+                    update={"chosen_code": code, "model": model}
                 )
             seen.add(decision.index)
         self.response_issues["missing_indices"] += len(valid_codes.keys() - seen)

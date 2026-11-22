@@ -1,8 +1,16 @@
 import asyncio
 from collections.abc import Sequence
+from itertools import islice
+from threading import Lock
 
+from app.retrieval_text import hierarchy_text
 from app.schemas.contracts import Account, MappingResult, TopCandidate
-from app.services.indexer import Candidate, SearchIndex
+from app.services.indexer import (
+    CANDIDATE_LIMIT,
+    GEMINI_SHORTLIST_LIMIT,
+    Candidate,
+    SearchIndex,
+)
 from app.services.llm_reranker import REVIEW_CONFIDENCE_CAP, GeminiReranker, RerankInput
 from app.services.normalizer import Normalizer
 
@@ -12,6 +20,40 @@ MIN_DENSE = 0.88
 MIN_APPROVAL_HISTORY = 0.895
 REQUEST_BUDGET = 50.0
 HAPPY_PATH_REASON = "Deterministic retrieval evidence met the approval criteria."
+RERANKER_MODEL = "BAAI/bge-reranker-base"
+
+
+class LocalReranker:
+    def __init__(self, model_name):
+        from sentence_transformers import CrossEncoder
+
+        self.model = CrossEncoder(model_name, device="cpu")
+        self.lock = Lock()
+
+    def rank(self, queries_and_candidates):
+        pairs = [
+            (
+                query.text,
+                hierarchy_text(candidate.target.name, candidate.target.hierarchy),
+            )
+            for query, candidates in queries_and_candidates
+            for candidate in candidates
+        ]
+        if not pairs:
+            return []
+        with self.lock:
+            scores = iter(
+                self.model.predict(pairs, batch_size=32, show_progress_bar=False)
+            )
+        ranked = []
+        for _, candidates in queries_and_candidates:
+            scored = zip(candidates, islice(scores, len(candidates)), strict=True)
+            ordered = sorted(
+                scored,
+                key=lambda pair: (-round(float(pair[1]), 6), pair[0].target.code),
+            )
+            ranked.append([candidate for candidate, _ in ordered])
+        return ranked
 
 
 def happy_path(candidates, has_red_flag):
@@ -56,7 +98,7 @@ def mapped_result(account, candidates, selected, confidence, status, reasoning):
         routing_status=status,
         top_k_candidates=[
             TopCandidate(code=c.target.code, name=c.target.name, score=c.score)
-            for c in candidates
+            for c in candidates[:CANDIDATE_LIMIT]
         ],
         reasoning=reasoning,
     )
@@ -64,11 +106,17 @@ def mapped_result(account, candidates, selected, confidence, status, reasoning):
 
 class MappingEngine:
     def __init__(
-        self, normalizer: Normalizer, index: SearchIndex, reranker: GeminiReranker
+        self,
+        normalizer: Normalizer,
+        index: SearchIndex,
+        reranker: GeminiReranker,
+        local_reranker: LocalReranker | None = None,
     ):
         self.normalizer = normalizer
         self.index = index
         self.reranker = reranker
+        self.local_reranker = local_reranker
+        self.shortlist_limit = GEMINI_SHORTLIST_LIMIT
 
     def _retrieve(self, accounts):
         active = [
@@ -78,9 +126,9 @@ class MappingEngine:
         ]
         queries = [self.normalizer.account_query(account) for _, account in active]
         vectors = self.index.embed([query.text for query in queries])
-        return [
-            (position, query, vector, candidates)
-            for (position, _), query, vector, candidates in zip(
+        retrieved = [
+            (position, query, vector, pool)
+            for (position, _), query, vector, pool in zip(
                 active,
                 queries,
                 vectors,
@@ -88,8 +136,38 @@ class MappingEngine:
                 strict=True,
             )
         ]
+        ranked = (
+            self.local_reranker.rank([(query, pool) for _, query, _, pool in retrieved])
+            if self.local_reranker
+            else [pool for _, _, _, pool in retrieved]
+        )
+        results = []
+        for (position, query, vector, pool), candidates in zip(
+            retrieved, ranked, strict=True
+        ):
+            approved = happy_path(pool, query.has_red_flag)
+            if approved:
+                candidates = [pool[0], *(c for c in candidates if c != pool[0])]
+            results.append(
+                (
+                    position,
+                    query,
+                    vector,
+                    pool,
+                    candidates[: self.shortlist_limit],
+                    approved,
+                )
+            )
+        return results
 
-    async def map_accounts(self, accounts: Sequence[Account]) -> list[MappingResult]:
+    async def map_accounts(
+        self,
+        accounts: Sequence[Account],
+        *,
+        observe_pool=None,
+        observe_decision=None,
+        observe_shortlist=None,
+    ) -> list[MappingResult]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + REQUEST_BUDGET
         results = {
@@ -101,9 +179,13 @@ class MappingEngine:
             return list(results.values())
         retrieved = await asyncio.to_thread(self._retrieve, accounts)
         pending = []
-        for position, query, vector, candidates in retrieved:
+        for position, query, vector, pool, candidates, approved in retrieved:
+            if observe_pool is not None:
+                observe_pool(position, pool)
+            if observe_shortlist is not None:
+                observe_shortlist(position, candidates)
             best = candidates[0]
-            if happy_path(candidates, query.has_red_flag):
+            if approved:
                 results[position] = mapped_result(
                     accounts[position],
                     candidates,
@@ -144,9 +226,11 @@ class MappingEngine:
             selected: Candidate = candidates[0]
             confidence = selected.score
             reason = (
-                "Gemini reranking was unavailable. Showing the top hybrid candidate."
+                "Gemini reranking was unavailable. Showing the top local candidate."
             )
             if decision is not None:
+                if observe_decision is not None:
+                    observe_decision(position, candidates[0], decision)
                 selected = next(
                     candidate
                     for candidate in candidates

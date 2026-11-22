@@ -10,6 +10,11 @@ wheels/
 .venv/
 .uv-cache/
 .chroma/
+CONVERSATION*.md
+PROMPT_*.md
+message.md
+backend-docs/
+reports/latest/
 data/raw_extracted/
 Given-Resources/
 .env

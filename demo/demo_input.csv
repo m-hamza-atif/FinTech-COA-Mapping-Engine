@@ -1,0 +1,5 @@
+SourceAccountCode,SourceAccountName,Normal Balance,Ending Balance,Exclude
+1320-200,Interest Receivable,Debit,14250.00,false
+1601-030,Reimbursable Cdn - Unreconciled Credit Cards,Debit,,false
+999900,Dormant ledger control,,,true
+000004,,,,false

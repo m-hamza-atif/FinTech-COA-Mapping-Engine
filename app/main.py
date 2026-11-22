@@ -8,10 +8,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 
 from app.schemas.contracts import AIInput, AIOutput
-from app.services.indexer import SearchIndex
+from app.services.indexer import GEMINI_SHORTLIST_LIMIT, RETRIEVAL_LIMIT, SearchIndex
 from app.services.llm_reranker import DEFAULT_MODEL, GeminiReranker
 from app.services.normalizer import Normalizer
-from app.services.retriever import MappingEngine
+from app.services.retriever import LocalReranker, MappingEngine
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,10 +23,20 @@ async def lifespan(application: FastAPI):
     cache_dir = Path(os.getenv("MAPPING_CHROMA_DIR", str(ROOT / ".chroma")))
     normalizer = Normalizer(data_dir)
     index = await asyncio.to_thread(SearchIndex, data_dir, cache_dir, normalizer)
+    local_model = os.getenv("RERANKER_MODEL", "off").strip()
+    local_reranker = None
+    index.candidate_limit = GEMINI_SHORTLIST_LIMIT
+    if local_model.casefold() not in {"", "off", "none", "disabled"}:
+        local_reranker = await asyncio.to_thread(LocalReranker, local_model)
+        index.candidate_limit = RETRIEVAL_LIMIT
     reranker = GeminiReranker(
-        os.getenv("GEMINI_API_KEY"), os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
+        os.getenv("GEMINI_API_KEY"),
+        os.getenv("GEMINI_MODEL", DEFAULT_MODEL),
+        pace_seconds=float(os.getenv("GEMINI_PACE_SECONDS", "0")),
     )
-    application.state.engine = MappingEngine(normalizer, index, reranker)
+    application.state.engine = MappingEngine(
+        normalizer, index, reranker, local_reranker
+    )
     try:
         yield
     finally:

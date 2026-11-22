@@ -4,6 +4,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.33 /uv /bin/uv
 ENV UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
     HF_HOME=/opt/huggingface \
+    EMBEDDING_MODEL=BAAI/bge-small-en-v1.5 \
     HF_HUB_DISABLE_XET=1 \
     OMP_NUM_THREADS=4 \
     MKL_NUM_THREADS=4
@@ -27,6 +28,8 @@ FROM python:3.12-slim-trixie
 ENV PATH="/app/.venv/bin:$PATH" \
     HF_HOME=/opt/huggingface \
     HF_HUB_OFFLINE=1 \
+    EMBEDDING_MODEL=BAAI/bge-small-en-v1.5 \
+    RERANKER_MODEL=off \
     PYTHONUNBUFFERED=1 \
     OMP_NUM_THREADS=4 \
     MKL_NUM_THREADS=4
