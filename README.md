@@ -2,6 +2,11 @@
 
 Developed by the **FAST-NUCES Islamabad AI/NLP team** for the **BCU International FinTech Competition 2026**. The service maps source ledger accounts to the target chart of accounts (COA). It runs on port `8001` alongside Fintech-Backend on port `8000`.
 
+### Links
+
+Fintech Mapping Engine Docker Image: https://hub.docker.com/r/mhamzaatif/fintech-mapping-engine
+Fintech Backend Docker Image: https://hub.docker.com/r/mhuzaima/fintech-backend
+
 ## How it works
 
 | Routing path | Behavior |
